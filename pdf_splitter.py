@@ -20,7 +20,7 @@ def split_pdf_to_pages(source_pdf_path: str, output_directory: str) -> None:
         
         # Read the source PDF
         reader = PdfReader(source_pdf_path)
-        total_pages = len(reader)
+        total_pages = len(reader.pages)
         
         print(f"[INFO] Started splitting '{source_pdf_path}' ({total_pages} pages)...")
         

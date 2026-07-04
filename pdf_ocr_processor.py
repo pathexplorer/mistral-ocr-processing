@@ -2,7 +2,7 @@ import os
 import sys
 import glob
 import asyncio
-from mistralai import Mistral
+from mistralai.client import Mistral
 
 async def process_single_page(client: Mistral, file_path: str, output_dir: str, semaphore: asyncio.Semaphore) -> str:
     """
@@ -31,7 +31,7 @@ async def process_single_page(client: Mistral, file_path: str, output_dir: str, 
                     document={"type": "pdf", "file": pdf_file}
                 )
                 
-                markdown_text = ocr_response.markdown
+                markdown_text = ocr_response.pages[0].markdown
                 
                 # Cache the individual result immediately to save progress
                 with open(md_filepath, "w", encoding="utf-8") as md_file:

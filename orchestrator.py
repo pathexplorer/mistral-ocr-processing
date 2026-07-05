@@ -83,24 +83,35 @@ def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str) -> bool:
         return False
 
     # --- Smart column detection ---
-    # Collect unique left-edge (x0) coordinates to find column boundaries
-    x0_values = sorted(set(b[0] for b in blocks))
+    # Cluster x0 values (±5pt) to find true column boundaries vs indentation
+    x0_clusters = {}
+    for b in blocks:
+        cluster = round(b[0] / 5) * 5  # snap to nearest 5pt grid
+        x0_clusters[cluster] = x0_clusters.get(cluster, 0) + 1
     
-    # Find the largest horizontal gap between consecutive x0 clusters
+    # A "dominant column" has 3+ blocks at that X position
+    dominant_columns = [x for x, count in x0_clusters.items() if count >= 3]
+    dominant_columns.sort()
+    
+    # Find max gap between dominant columns
     max_gap = 0
-    for i in range(1, len(x0_values)):
-        gap = x0_values[i] - x0_values[i-1]
+    for i in range(1, len(dominant_columns)):
+        gap = dominant_columns[i] - dominant_columns[i-1]
         if gap > max_gap:
             max_gap = gap
     
-    # Heuristic: if largest gap > 25% of page width → truly separate tables → X-first sort
-    # Otherwise → one logical table with columns → Y-first sort (preserve row order)
+    # Only use X-first sort when there are 2-3 dominant columns with a wide gap
+    # (truly separate tables), not scattered indentation variations
     COLUMN_GAP_THRESHOLD = 0.25
+    is_multi_column = (
+        2 <= len(dominant_columns) <= 3
+        and max_gap > page_width * COLUMN_GAP_THRESHOLD
+    )
     
-    if max_gap > page_width * COLUMN_GAP_THRESHOLD:
+    if is_multi_column:
         blocks.sort(key=lambda b: (b[0], b[1]))   # X-first: separate tables
     else:
-        blocks.sort(key=lambda b: (b[1], b[0]))   # Y-first: single table, row order
+        blocks.sort(key=lambda b: (b[1], b[0]))   # Y-first: reading order
     
     extracted_text_pieces = []
     for b in blocks:

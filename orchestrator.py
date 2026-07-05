@@ -49,12 +49,12 @@ def split_pdf_to_pages(source_pdf_path: str, output_directory: str) -> int:
 # ==========================================
 # КРОК 2: Аналізатор текстового шару
 # ==========================================
-def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str, sort_by_date: bool = False) -> bool:
+def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str, sort_by_date: bool = False, force: bool = False) -> bool:
     base_name = os.path.basename(pdf_path)
     md_filename = os.path.splitext(base_name)[0] + ".md"
     md_filepath = os.path.join(cache_dir, md_filename)
     
-    if os.path.exists(md_filepath):
+    if os.path.exists(md_filepath) and not force:
         # Validate cached content — skip only if it contains real text, not an error stub
         with open(md_filepath, "r", encoding="utf-8") as f:
             cached = f.read().strip()
@@ -254,11 +254,16 @@ def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str, sort_by_d
 # ==========================================
 # КРОК 3: Асинхронний виклик Mistral OCR
 # ==========================================
-async def process_ocr_page(client: Mistral, file_path: str, cache_dir: str, semaphore: asyncio.Semaphore):
+async def process_ocr_page(client: Mistral, file_path: str, cache_dir: str, semaphore: asyncio.Semaphore, ocr_log: dict):
     base_name = os.path.basename(file_path)
     md_filename = os.path.splitext(base_name)[0] + ".md"
     md_filepath = os.path.join(cache_dir, md_filename)
     
+    # Skip if already successfully OCR'd (tracked in log) and cache file exists
+    if ocr_log.get(base_name) == "success" and os.path.exists(md_filepath):
+        print(f"[SKIP] {base_name} already OCR'd successfully (from log).")
+        return
+
     if os.path.exists(md_filepath):
         return
 
@@ -305,10 +310,12 @@ async def process_ocr_page(client: Mistral, file_path: str, cache_dir: str, sema
 
             with open(md_filepath, "w", encoding="utf-8") as f:
                 f.write(ocr_response.pages[0].markdown)
+            ocr_log[base_name] = "success"
             print(f"[API SUCCESS] OCR completed for {base_name}")
                 
         except Exception as e:
             print(f"[API ERROR] Failed to process {base_name}: {e}", file=sys.stderr)
+            ocr_log[base_name] = "error"
             # Write error stub to prevent pipeline interruption
             with open(md_filepath, "w", encoding="utf-8") as f:
                 f.write(f"\n\n## ERROR EXTRACTING DATA FROM {base_name} ##\n\n")
@@ -412,13 +419,23 @@ async def process_pages_batch(client: Mistral, ocr_pages: list, cache_dir: str):
 # ==========================================
 # КРОК 4: Оркестрація та Агрегація
 # ==========================================
-async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use_batch: bool = False, sort_by_date: bool = False):
+async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use_batch: bool = False, sort_by_date: bool = False, force: bool = False):
     # EXPLICIT GATE: Validate configuration BEFORE processing any heavy data files
     api_key = validate_api_key()
     
     pages_dir = os.path.join(workspace_dir, "split_pages")
     cache_dir = os.path.join(workspace_dir, "ocr_cache")
+    ocr_log_path = os.path.join(workspace_dir, "ocr_log.json")
     os.makedirs(cache_dir, exist_ok=True)
+    
+    # Load OCR log: tracks which pages were successfully sent to API
+    ocr_log = {}
+    if os.path.exists(ocr_log_path):
+        with open(ocr_log_path, "r", encoding="utf-8") as f:
+            ocr_log = json.load(f)
+    
+    if force:
+        print("[INFO] --force enabled: overwriting all cached results.")
     
     # 1. Split PDF
     total_pages = split_pdf_to_pages(pdf_source, pages_dir)
@@ -432,7 +449,7 @@ async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use
     
     for pdf_file in all_pdf_files:
         try:
-            has_text = extract_native_text_or_mark_for_ocr(pdf_file, cache_dir, sort_by_date)
+            has_text = extract_native_text_or_mark_for_ocr(pdf_file, cache_dir, sort_by_date, force)
         except Exception as e:
             print(f"[ERROR] Failed analyzing {os.path.basename(pdf_file)}: {e}")
             traceback.print_exc()
@@ -446,20 +463,30 @@ async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use
     
     # Log pages that are going to OCR for transparency
     if ocr_needed_list:
-        print(f"[LOG] Pages queued for OCR routing: {[os.path.basename(p) for p in ocr_needed_list]}")
+        # Filter out pages already successfully OCR'd (unless --force)
+        if not force:
+            already_done = [p for p in ocr_needed_list if ocr_log.get(os.path.basename(p)) == "success"]
+            if already_done:
+                print(f"[SKIP] {len(already_done)} pages already OCR'd (from log): {[os.path.basename(p) for p in already_done]}")
+                ocr_needed_list = [p for p in ocr_needed_list if ocr_log.get(os.path.basename(p)) != "success"]
         
-        async with Mistral(api_key=api_key) as client:
-            if use_batch:
-                # Batch mode: one job, 50% cheaper, async queue
-                await process_pages_batch(client, ocr_needed_list, cache_dir)
-            else:
-                # Real-time mode: concurrent API calls with semaphore
-                semaphore = asyncio.Semaphore(5)
-                tasks = [
-                    process_ocr_page(client, page, cache_dir, semaphore)
-                    for page in ocr_needed_list
-                ]
-                await asyncio.gather(*tasks)
+        if ocr_needed_list:
+            print(f"[LOG] Pages queued for OCR routing: {[os.path.basename(p) for p in ocr_needed_list]}")
+            
+            async with Mistral(api_key=api_key) as client:
+                if use_batch:
+                    await process_pages_batch(client, ocr_needed_list, cache_dir)
+                else:
+                    semaphore = asyncio.Semaphore(5)
+                    tasks = [
+                        process_ocr_page(client, page, cache_dir, semaphore, ocr_log)
+                        for page in ocr_needed_list
+                    ]
+                    await asyncio.gather(*tasks)
+            
+            # Save OCR log after processing
+            with open(ocr_log_path, "w", encoding="utf-8") as f:
+                json.dump(ocr_log, f, indent=2, ensure_ascii=False)
             
     # 4. Final Aggregation of all generated Markdown files
     print(f"[COMPILING] Merging all page buffers into {output_md}...")
@@ -498,11 +525,16 @@ if __name__ == "__main__":
         "--sort-by-date", action="store_true",
         help="Sort table rows chronologically by detected date column"
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Force re-extraction of all pages, ignoring cache and OCR log"
+    )
     args = parser.parse_args()
 
     try:
         asyncio.run(main_pipeline(args.pdf, args.workspace, args.output,
-                                  use_batch=args.batch, sort_by_date=args.sort_by_date))
+                                  use_batch=args.batch, sort_by_date=args.sort_by_date,
+                                  force=args.force))
     except KeyboardInterrupt:
         print("\n[INFO] Pipeline paused by user command.")
     except Exception as err:

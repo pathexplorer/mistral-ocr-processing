@@ -120,26 +120,39 @@ def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str) -> bool:
             extracted_text_pieces.append(text_content)
 
     # --- Detect tabular structure ---
-    # Blocks with consistent \n-separated cells → format as markdown table
+    # Separate metadata blocks (1 cell) from potential table rows (2+ cells)
+    # 1-cell blocks are typically headers/footers, not table data
     cells_per_block = [
         len([c.strip() for c in txt.split('\n') if c.strip()])
         for txt in extracted_text_pieces
     ]
     
-    if cells_per_block:
-        most_common_cols = max(set(cells_per_block), key=cells_per_block.count)
-        consistent_count = sum(1 for c in cells_per_block if c == most_common_cols)
+    multi_cell_indices = [i for i, c in enumerate(cells_per_block) if c >= 2]
+    if multi_cell_indices:
+        multi_cell_counts = [cells_per_block[i] for i in multi_cell_indices]
+        most_common_cols = max(set(multi_cell_counts), key=multi_cell_counts.count)
+        consistent_count = sum(1 for c in multi_cell_counts if c == most_common_cols)
+        # Lower threshold (50%) since 1-cell noise is already filtered out
         is_tabular = (
             most_common_cols >= 3 and
-            consistent_count >= len(cells_per_block) * 0.7
+            consistent_count >= len(multi_cell_counts) * 0.5
         )
     else:
         is_tabular = False
 
     if is_tabular:
-        # Build markdown table from \n-separated cell blocks
+        # Split: 1-cell blocks → plain text, multi-cell blocks → table rows
+        plain_parts = []
+        table_parts = []
+        for i, txt in enumerate(extracted_text_pieces):
+            if cells_per_block[i] >= 2:
+                table_parts.append(txt)
+            else:
+                plain_parts.append(txt)
+
+        # Build markdown table from multi-cell blocks
         rows = []
-        for txt in extracted_text_pieces:
+        for txt in table_parts:
             cells = [c.strip() for c in txt.split('\n') if c.strip()]
             if len(cells) > most_common_cols:
                 cells = cells[:most_common_cols]
@@ -178,6 +191,10 @@ def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str) -> bool:
                 r.append('')
 
         lines = []
+        # Plain text parts (metadata/headers) go before the table
+        if plain_parts:
+            lines.append('\n\n'.join(plain_parts))
+            lines.append('')  # blank separator
         # Header row (first data row used as header)
         lines.append('| ' + ' | '.join(merged_rows[0]) + ' |')
         # Separator

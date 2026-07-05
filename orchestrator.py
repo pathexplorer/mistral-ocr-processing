@@ -6,11 +6,20 @@ import json
 import asyncio
 import argparse
 import traceback
+from datetime import date
 import fitz  # PyMuPDF
 from pypdf import PdfReader, PdfWriter
 from mistralai.client import Mistral
 # Import the new validation module
 from config import validate_api_key
+
+# ==========================================
+# Pricing constants (Mistral OCR, USD per page)
+# Source: https://mistral.ai/pricing/api/
+# Update if Mistral changes pricing
+# ==========================================
+OCR_PRICE_PER_PAGE = 4.0 / 1000        # $4.00 per 1000 pages (standard)
+OCR_PRICE_BATCH_PER_PAGE = 2.0 / 1000   # 50% off for batch mode
 
 # ==========================================
 # КРОК 1: Розбиття PDF на окремі сторінки
@@ -482,6 +491,7 @@ async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use
     print(f"[ANALYSIS SUMMARY] Total: {total_pages} | Native Text: {native_text_count} | Requires OCR: {len(ocr_needed_list)}")
     
     # Log pages that are going to OCR for transparency
+    ocr_processed_count = 0
     if ocr_needed_list:
         # Filter out pages already successfully OCR'd (unless --force)
         if not force:
@@ -492,6 +502,7 @@ async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use
         
         if ocr_needed_list:
             print(f"[LOG] Pages queued for OCR routing: {[os.path.basename(p) for p in ocr_needed_list]}")
+            ocr_processed_count = len(ocr_needed_list)
             
             async with Mistral(api_key=api_key) as client:
                 if use_batch:
@@ -507,6 +518,46 @@ async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use
             # Save OCR log after processing
             with open(ocr_log_path, "w", encoding="utf-8") as f:
                 json.dump(ocr_log, f, indent=2, ensure_ascii=False)
+
+    # --- Cost tracking ---
+    cost_log_path = os.path.join(workspace_dir, "cost_tracker.json")
+    cost_data = {"by_date": {}, "all_time": {"pages": 0, "batch_pages": 0, "cost": 0.0}}
+    if os.path.exists(cost_log_path):
+        with open(cost_log_path, "r", encoding="utf-8") as f:
+            cost_data = json.load(f)
+    
+    today = str(date.today())
+    cost_data["by_date"].setdefault(today, {"pages": 0, "batch_pages": 0})
+    cost_data.setdefault("all_time", {"pages": 0, "batch_pages": 0, "cost": 0.0})
+    
+    ocr_processed = ocr_processed_count
+    
+    if ocr_processed > 0:
+        if use_batch:
+            cost_data["by_date"][today]["batch_pages"] += ocr_processed
+            cost_data["all_time"]["batch_pages"] += ocr_processed
+            run_cost = ocr_processed * OCR_PRICE_BATCH_PER_PAGE
+        else:
+            cost_data["by_date"][today]["pages"] += ocr_processed
+            cost_data["all_time"]["pages"] += ocr_processed
+            run_cost = ocr_processed * OCR_PRICE_PER_PAGE
+        
+        cost_data["all_time"]["cost"] += run_cost
+        
+        with open(cost_log_path, "w", encoding="utf-8") as f:
+            json.dump(cost_data, f, indent=2)
+        
+        mode_label = "batch" if use_batch else "standard"
+        print(f"[COST] This run: {ocr_processed} OCR pages ({mode_label}) → ${run_cost:.4f}")
+    
+    td = cost_data["by_date"][today]
+    today_pages = td["pages"] + td["batch_pages"]
+    today_cost = td["pages"] * OCR_PRICE_PER_PAGE + td["batch_pages"] * OCR_PRICE_BATCH_PER_PAGE
+    if today_pages > 0:
+        print(f"[COST] Today ({today}): {today_pages} pages → ${today_cost:.4f}")
+    at = cost_data["all_time"]
+    if at["pages"] + at["batch_pages"] > 0:
+        print(f"[COST] All-time: {at['pages'] + at['batch_pages']} pages → ${at['cost']:.4f}")
             
     # 4. Final Aggregation of all generated Markdown files
     print(f"[COMPILING] Merging all page buffers into {output_md}...")

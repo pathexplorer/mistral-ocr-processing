@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import glob
 import json
 import asyncio
@@ -48,7 +49,7 @@ def split_pdf_to_pages(source_pdf_path: str, output_directory: str) -> int:
 # ==========================================
 # КРОК 2: Аналізатор текстового шару
 # ==========================================
-def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str) -> bool:
+def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str, sort_by_date: bool = False) -> bool:
     base_name = os.path.basename(pdf_path)
     md_filename = os.path.splitext(base_name)[0] + ".md"
     md_filepath = os.path.join(cache_dir, md_filename)
@@ -185,6 +186,37 @@ def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str) -> bool:
 
         # Recalculate column count after merging
         final_cols = max(len(r) for r in merged_rows)
+
+        # --- Optional: sort rows by date column ---
+        if sort_by_date and len(merged_rows) > 1:
+            # Detect date column: first column matching DD.MM.YYYY or YYYY-MM-DD
+            date_pattern = re.compile(r'^\d{2}\.\d{2}\.\d{4}$|^\d{4}-\d{2}-\d{2}$')
+            date_col = None
+            for col_idx in range(final_cols):
+                matches = 0
+                for row in merged_rows:
+                    if col_idx < len(row) and date_pattern.match(row[col_idx]):
+                        matches += 1
+                if matches >= len(merged_rows) * 0.5:  # 50%+ rows have dates here
+                    date_col = col_idx
+                    break
+
+            if date_col is not None:
+                from datetime import datetime
+                def parse_date(row):
+                    val = row[date_col] if date_col < len(row) else ''
+                    for fmt in ('%d.%m.%Y', '%Y-%m-%d'):
+                        try:
+                            return datetime.strptime(val, fmt)
+                        except ValueError:
+                            continue
+                    return datetime.min  # unparseable → sort first
+
+                header = merged_rows[0]
+                data_rows = merged_rows[1:]
+                data_rows.sort(key=parse_date)
+                merged_rows = [header] + data_rows
+
         # Normalize to final column count
         for r in merged_rows:
             while len(r) < final_cols:
@@ -380,7 +412,7 @@ async def process_pages_batch(client: Mistral, ocr_pages: list, cache_dir: str):
 # ==========================================
 # КРОК 4: Оркестрація та Агрегація
 # ==========================================
-async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use_batch: bool = False):
+async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use_batch: bool = False, sort_by_date: bool = False):
     # EXPLICIT GATE: Validate configuration BEFORE processing any heavy data files
     api_key = validate_api_key()
     
@@ -400,7 +432,7 @@ async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use
     
     for pdf_file in all_pdf_files:
         try:
-            has_text = extract_native_text_or_mark_for_ocr(pdf_file, cache_dir)
+            has_text = extract_native_text_or_mark_for_ocr(pdf_file, cache_dir, sort_by_date)
         except Exception as e:
             print(f"[ERROR] Failed analyzing {os.path.basename(pdf_file)}: {e}")
             traceback.print_exc()
@@ -462,10 +494,15 @@ if __name__ == "__main__":
         "--batch", action="store_true",
         help="Use Batch API for OCR (50%% cheaper, async job queue)"
     )
+    parser.add_argument(
+        "--sort-by-date", action="store_true",
+        help="Sort table rows chronologically by detected date column"
+    )
     args = parser.parse_args()
 
     try:
-        asyncio.run(main_pipeline(args.pdf, args.workspace, args.output, use_batch=args.batch))
+        asyncio.run(main_pipeline(args.pdf, args.workspace, args.output,
+                                  use_batch=args.batch, sort_by_date=args.sort_by_date))
     except KeyboardInterrupt:
         print("\n[INFO] Pipeline paused by user command.")
     except Exception as err:

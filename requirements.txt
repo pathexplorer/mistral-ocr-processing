@@ -1,3 +1,4 @@
 pypdf
 mistralai
 PyMuPDF
+docling

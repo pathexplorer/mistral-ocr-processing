@@ -1,6 +1,5 @@
 import os
 import sys
-import re
 import glob
 import json
 import asyncio
@@ -10,7 +9,6 @@ from datetime import date
 import fitz  # PyMuPDF
 from pypdf import PdfReader, PdfWriter
 from mistralai.client import Mistral
-# Import the new validation module
 from config import validate_api_key
 
 # ==========================================
@@ -56,21 +54,37 @@ def split_pdf_to_pages(source_pdf_path: str, output_directory: str) -> int:
     return total_pages
 
 # ==========================================
-# КРОК 2: Аналізатор текстового шару
+# КРОК 2: Аналізатор текстового шару (IBM Docling)
 # ==========================================
+import os as _os
+_docling_conv = None
+
+def _get_docling_converter():
+    """Lazy-init Docling converter (CPU-only, digital PDFs — no OCR)."""
+    global _docling_conv
+    if _docling_conv is None:
+        _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")  # force CPU
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        pipeline_opts = PdfPipelineOptions()
+        pipeline_opts.do_ocr = False  # digital PDFs only
+        _docling_conv = DocumentConverter(
+            format_options={"pdf": PdfFormatOption(pipeline_options=pipeline_opts)}
+        )
+    return _docling_conv
+
 def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str, sort_by_date: bool = False, force: bool = False) -> bool:
     base_name = os.path.basename(pdf_path)
     md_filename = os.path.splitext(base_name)[0] + ".md"
     md_filepath = os.path.join(cache_dir, md_filename)
     
     if os.path.exists(md_filepath) and not force:
-        # Validate cached content — skip only if it contains real text, not an error stub
         with open(md_filepath, "r", encoding="utf-8") as f:
             cached = f.read().strip()
         if cached and "## ERROR EXTRACTING DATA" not in cached and len(cached) > 20:
             return True
-        # Otherwise, stale/error cache — re-extract below
 
+    # Quick pre-check: does the PDF have any native text at all?
     doc = fitz.open(pdf_path)
     if len(doc) == 0:
         doc.close()
@@ -79,183 +93,22 @@ def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str, sort_by_d
     if page is None:
         doc.close()
         return False
-    
-    # Quick pre-check: does the page have ANY selectable text at all?
     raw_text = page.get_text("text").strip()
-    
-    # Save page dimensions before closing doc (close invalidates C page data)
-    page_width = page.rect.width
-
-    blocks = page.get_text("blocks")
-    
-    if not blocks:
-        doc.close()
-        return False
-
-    # --- Smart column detection ---
-    # Cluster x0 values (±5pt) to find true column boundaries vs indentation
-    x0_clusters = {}
-    for b in blocks:
-        cluster = round(b[0] / 5) * 5  # snap to nearest 5pt grid
-        x0_clusters[cluster] = x0_clusters.get(cluster, 0) + 1
-    
-    # A "dominant column" has 3+ blocks at that X position
-    dominant_columns = [x for x, count in x0_clusters.items() if count >= 3]
-    dominant_columns.sort()
-    
-    # Find max gap between dominant columns
-    max_gap = 0
-    for i in range(1, len(dominant_columns)):
-        gap = dominant_columns[i] - dominant_columns[i-1]
-        if gap > max_gap:
-            max_gap = gap
-    
-    # Only use X-first sort when there are 2-3 dominant columns with a wide gap
-    # (truly separate tables), not scattered indentation variations
-    COLUMN_GAP_THRESHOLD = 0.25
-    is_multi_column = (
-        2 <= len(dominant_columns) <= 3
-        and max_gap > page_width * COLUMN_GAP_THRESHOLD
-    )
-    
-    if is_multi_column:
-        blocks.sort(key=lambda b: (b[0], b[1]))   # X-first: separate tables
-    else:
-        blocks.sort(key=lambda b: (b[1], b[0]))   # Y-first: reading order
-    
-    extracted_text_pieces = []
-    for b in blocks:
-        text_content = b[4].strip()
-        if text_content:
-            extracted_text_pieces.append(text_content)
-
-    # --- Detect tabular structure ---
-    # Separate metadata blocks (1 cell) from potential table rows (2+ cells)
-    # 1-cell blocks are typically headers/footers, not table data
-    cells_per_block = [
-        len([c.strip() for c in txt.split('\n') if c.strip()])
-        for txt in extracted_text_pieces
-    ]
-    
-    multi_cell_indices = [i for i, c in enumerate(cells_per_block) if c >= 2]
-    if multi_cell_indices:
-        multi_cell_counts = [cells_per_block[i] for i in multi_cell_indices]
-        most_common_cols = max(set(multi_cell_counts), key=multi_cell_counts.count)
-        consistent_count = sum(1 for c in multi_cell_counts if c == most_common_cols)
-        # Require ≥3 columns, ≥5 dominant-format rows, and ≥35% consistency
-        # (35% handles pages with a main table + small summary/footer section)
-        is_tabular = (
-            most_common_cols >= 3 and
-            consistent_count >= 5 and
-            consistent_count >= len(multi_cell_counts) * 0.35
-        )
-    else:
-        is_tabular = False
-
-    if is_tabular:
-        # Split: dominant-format blocks (±1 tolerance) → table, others → plain text
-        plain_parts = []
-        table_parts = []
-        for i, txt in enumerate(extracted_text_pieces):
-            if abs(cells_per_block[i] - most_common_cols) <= 1:
-                table_parts.append(txt)
-            else:
-                plain_parts.append(txt)
-
-        # Build markdown table from multi-cell blocks
-        rows = []
-        for txt in table_parts:
-            cells = [c.strip() for c in txt.split('\n') if c.strip()]
-            if len(cells) > most_common_cols:
-                cells = cells[:most_common_cols]
-            elif len(cells) < most_common_cols:
-                cells += [''] * (most_common_cols - len(cells))
-            rows.append(cells)
-
-        # Merge fragmented numeric cells: "0." + "00" → "0.00", "38.4" + "%" → "38.4 %"
-        merged_rows = []
-        for row in rows:
-            merged = []
-            skip_next = False
-            for i in range(len(row)):
-                if skip_next:
-                    skip_next = False
-                    continue
-                cell = row[i]
-                # Merge: left cell ends with '.' or ',' and right cell is pure digits
-                if i + 1 < len(row) and (cell.endswith('.') or cell.endswith(',')):
-                    right = row[i + 1]
-                    if right.isdigit() or (right.endswith('%') and right[:-1].strip().isdigit()):
-                        cell = cell + right
-                        skip_next = True
-                # Merge: right cell is '%' symbol alone
-                elif i + 1 < len(row) and row[i + 1].strip() == '%':
-                    cell = cell + ' %'
-                    skip_next = True
-                merged.append(cell)
-            merged_rows.append(merged)
-
-        # Recalculate column count after merging
-        final_cols = max(len(r) for r in merged_rows)
-
-        # --- Optional: sort rows by date column ---
-        if sort_by_date and len(merged_rows) > 1:
-            # Detect date column: first column matching DD.MM.YYYY or YYYY-MM-DD
-            date_pattern = re.compile(r'^\d{2}\.\d{2}\.\d{4}$|^\d{4}-\d{2}-\d{2}$')
-            date_col = None
-            for col_idx in range(final_cols):
-                matches = 0
-                for row in merged_rows:
-                    if col_idx < len(row) and date_pattern.match(row[col_idx]):
-                        matches += 1
-                if matches >= len(merged_rows) * 0.5:  # 50%+ rows have dates here
-                    date_col = col_idx
-                    break
-
-            if date_col is not None:
-                from datetime import datetime
-                def parse_date(row):
-                    val = row[date_col] if date_col < len(row) else ''
-                    for fmt in ('%d.%m.%Y', '%Y-%m-%d'):
-                        try:
-                            return datetime.strptime(val, fmt)
-                        except ValueError:
-                            continue
-                    return datetime.min  # unparseable → sort first
-
-                header = merged_rows[0]
-                data_rows = merged_rows[1:]
-                data_rows.sort(key=parse_date)
-                merged_rows = [header] + data_rows
-
-        # Normalize to final column count
-        for r in merged_rows:
-            while len(r) < final_cols:
-                r.append('')
-
-        lines = []
-        # Plain text parts (metadata/headers) go before the table
-        if plain_parts:
-            lines.append('\n\n'.join(plain_parts))
-            lines.append('')  # blank separator
-        # Header row (first data row used as header)
-        lines.append('| ' + ' | '.join(merged_rows[0]) + ' |')
-        # Separator
-        lines.append('| ' + ' | '.join(['---'] * final_cols) + ' |')
-        # Data rows
-        for row in merged_rows[1:]:
-            lines.append('| ' + ' | '.join(row) + ' |')
-
-        final_text = '\n'.join(lines)
-    else:
-        final_text = "\n\n".join(extracted_text_pieces)
-
     doc.close()
     
-    # Lower threshold (20 chars) catches sparse pages like headers/cover pages.
-    # Also: if PyMuPDF found raw text even below threshold, prefer local extraction
-    # over costly OCR for pages with just a few words.
-    if len(final_text.strip()) >= 20 or (len(raw_text) > 0 and len(final_text.strip()) > 0):
+    if not raw_text:
+        return False  # no text → route to OCR
+
+    # Use Docling for layout-aware extraction
+    try:
+        conv = _get_docling_converter()
+        result = conv.convert(pdf_path)
+        final_text = result.document.export_to_markdown()
+    except Exception as e:
+        print(f"[WARN] Docling failed for {base_name}: {e}", file=sys.stderr)
+        return False  # fall through to OCR
+    
+    if len(final_text.strip()) >= 20:
         with open(md_filepath, "w", encoding="utf-8") as f:
             f.write(final_text)
         return True

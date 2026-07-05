@@ -133,20 +133,22 @@ def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str, sort_by_d
         multi_cell_counts = [cells_per_block[i] for i in multi_cell_indices]
         most_common_cols = max(set(multi_cell_counts), key=multi_cell_counts.count)
         consistent_count = sum(1 for c in multi_cell_counts if c == most_common_cols)
-        # Lower threshold (50%) since 1-cell noise is already filtered out
+        # Require ≥3 columns, ≥5 dominant-format rows, and ≥35% consistency
+        # (35% handles pages with a main table + small summary/footer section)
         is_tabular = (
             most_common_cols >= 3 and
-            consistent_count >= len(multi_cell_counts) * 0.5
+            consistent_count >= 5 and
+            consistent_count >= len(multi_cell_counts) * 0.35
         )
     else:
         is_tabular = False
 
     if is_tabular:
-        # Split: 1-cell blocks → plain text, multi-cell blocks → table rows
+        # Split: dominant-format blocks (±1 tolerance) → table, others → plain text
         plain_parts = []
         table_parts = []
         for i, txt in enumerate(extracted_text_pieces):
-            if cells_per_block[i] >= 2:
+            if abs(cells_per_block[i] - most_common_cols) <= 1:
                 table_parts.append(txt)
             else:
                 plain_parts.append(txt)

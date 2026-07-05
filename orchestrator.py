@@ -18,9 +18,17 @@ def split_pdf_to_pages(source_pdf_path: str, output_directory: str) -> int:
     if not os.path.exists(source_pdf_path):
         raise FileNotFoundError(f"Source PDF not found at: {source_pdf_path}")
     
-    os.makedirs(output_directory, exist_ok=True)
     reader = PdfReader(source_pdf_path)
     total_pages = len(reader.pages)
+    
+    # Idempotency: skip if split pages already exist with correct count
+    if os.path.isdir(output_directory):
+        existing_pages = glob.glob(os.path.join(output_directory, "page_*.pdf"))
+        if len(existing_pages) == total_pages:
+            print(f"[SKIP] Split pages already exist in '{output_directory}' ({total_pages} pages). Using cached files.")
+            return total_pages
+    
+    os.makedirs(output_directory, exist_ok=True)
     
     print(f"[INFO] Splitting '{source_pdf_path}' ({total_pages} pages)...")
     padding_length = max(3, len(str(total_pages)))
@@ -99,8 +107,78 @@ def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str) -> bool:
         text_content = b[4].strip()
         if text_content:
             extracted_text_pieces.append(text_content)
-            
-    final_text = "\n\n".join(extracted_text_pieces)
+
+    # --- Detect tabular structure ---
+    # Blocks with consistent \n-separated cells → format as markdown table
+    cells_per_block = [
+        len([c.strip() for c in txt.split('\n') if c.strip()])
+        for txt in extracted_text_pieces
+    ]
+    
+    if cells_per_block:
+        most_common_cols = max(set(cells_per_block), key=cells_per_block.count)
+        consistent_count = sum(1 for c in cells_per_block if c == most_common_cols)
+        is_tabular = (
+            most_common_cols >= 3 and
+            consistent_count >= len(cells_per_block) * 0.7
+        )
+    else:
+        is_tabular = False
+
+    if is_tabular:
+        # Build markdown table from \n-separated cell blocks
+        rows = []
+        for txt in extracted_text_pieces:
+            cells = [c.strip() for c in txt.split('\n') if c.strip()]
+            if len(cells) > most_common_cols:
+                cells = cells[:most_common_cols]
+            elif len(cells) < most_common_cols:
+                cells += [''] * (most_common_cols - len(cells))
+            rows.append(cells)
+
+        # Merge fragmented numeric cells: "0." + "00" → "0.00", "38.4" + "%" → "38.4 %"
+        merged_rows = []
+        for row in rows:
+            merged = []
+            skip_next = False
+            for i in range(len(row)):
+                if skip_next:
+                    skip_next = False
+                    continue
+                cell = row[i]
+                # Merge: left cell ends with '.' or ',' and right cell is pure digits
+                if i + 1 < len(row) and (cell.endswith('.') or cell.endswith(',')):
+                    right = row[i + 1]
+                    if right.isdigit() or (right.endswith('%') and right[:-1].strip().isdigit()):
+                        cell = cell + right
+                        skip_next = True
+                # Merge: right cell is '%' symbol alone
+                elif i + 1 < len(row) and row[i + 1].strip() == '%':
+                    cell = cell + ' %'
+                    skip_next = True
+                merged.append(cell)
+            merged_rows.append(merged)
+
+        # Recalculate column count after merging
+        final_cols = max(len(r) for r in merged_rows)
+        # Normalize to final column count
+        for r in merged_rows:
+            while len(r) < final_cols:
+                r.append('')
+
+        lines = []
+        # Header row (first data row used as header)
+        lines.append('| ' + ' | '.join(merged_rows[0]) + ' |')
+        # Separator
+        lines.append('| ' + ' | '.join(['---'] * final_cols) + ' |')
+        # Data rows
+        for row in merged_rows[1:]:
+            lines.append('| ' + ' | '.join(row) + ' |')
+
+        final_text = '\n'.join(lines)
+    else:
+        final_text = "\n\n".join(extracted_text_pieces)
+
     doc.close()
     
     # Lower threshold (20 chars) catches sparse pages like headers/cover pages.

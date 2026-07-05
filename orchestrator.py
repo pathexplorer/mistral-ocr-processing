@@ -421,7 +421,7 @@ async def process_pages_batch(client: Mistral, ocr_pages: list, cache_dir: str):
 # ==========================================
 # КРОК 4: Оркестрація та Агрегація
 # ==========================================
-async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use_batch: bool = False, sort_by_date: bool = False, force: bool = False):
+async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use_batch: bool = False, sort_by_date: bool = False, force: bool = False, pages: str = None):
     # EXPLICIT GATE: Validate configuration BEFORE processing any heavy data files
     api_key = validate_api_key()
     
@@ -445,6 +445,24 @@ async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use
     # 2. Analyze all pages locally
     print("[INFO] Analyzing text layer status across all pages...")
     all_pdf_files = sorted(glob.glob(os.path.join(pages_dir, "page_*.pdf")))
+    
+    # If --pages specified, filter to those pages only and force re-extract them
+    target_pages = None
+    if pages:
+        target_pages = set()
+        for part in pages.split(","):
+            part = part.strip()
+            if "-" in part:
+                start, end = part.split("-", 1)
+                target_pages.update(range(int(start), int(end) + 1))
+            else:
+                target_pages.add(int(part))
+        all_pdf_files = [
+            f for f in all_pdf_files
+            if int(os.path.basename(f).split("_")[1].split(".")[0]) in target_pages
+        ]
+        print(f"[INFO] --pages filter: processing only {sorted(target_pages)} ({len(all_pdf_files)} files)")
+        force = True  # always force re-extract for explicitly requested pages
     
     ocr_needed_list = []
     native_text_count = 0
@@ -531,12 +549,16 @@ if __name__ == "__main__":
         "--force", action="store_true",
         help="Force re-extraction of all pages, ignoring cache and OCR log"
     )
+    parser.add_argument(
+        "--pages", type=str, default=None,
+        help="Process only specific pages (e.g. '61' or '61,65,70' or '61-70')"
+    )
     args = parser.parse_args()
 
     try:
         asyncio.run(main_pipeline(args.pdf, args.workspace, args.output,
                                   use_batch=args.batch, sort_by_date=args.sort_by_date,
-                                  force=args.force))
+                                  force=args.force, pages=args.pages))
     except KeyboardInterrupt:
         print("\n[INFO] Pipeline paused by user command.")
     except Exception as err:

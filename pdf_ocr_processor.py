@@ -23,12 +23,17 @@ async def process_single_page(client: Mistral, file_path: str, output_dir: str, 
     async with semaphore:
         print(f"[PROCESSING] Sending {base_name} to Mistral OCR API...")
         try:
+            # Detect file type for Mistral OCR API
+            ext = os.path.splitext(file_path)[1].lower()
+            IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+            doc_type = "image" if ext in IMAGE_EXTENSIONS else "pdf"
+
             # We open the file in standard binary mode, the SDK handles the upload stream
             with open(file_path, "rb") as pdf_file:
                 # Using the specialized, heavy-compute OCR endpoint
                 ocr_response = await client.ocr.process_async(
                     model="mistral-ocr-latest",
-                    document={"type": "pdf", "file": pdf_file}
+                    document={"type": doc_type, "file": pdf_file}
                 )
                 
                 markdown_text = ocr_response.pages[0].markdown
@@ -57,7 +62,11 @@ async def main_pipeline(input_dir: str, cache_dir: str, final_output_path: str):
     os.makedirs(cache_dir, exist_ok=True)
     
     # Locate all split pages and sort them to guarantee correct chronological order
-    pdf_pages = sorted(glob.glob(os.path.join(input_dir, "page_*.pdf")))
+    IMAGE_GLOB_PATTERNS = ["page_*.pdf", "page_*.jpg", "page_*.jpeg", "page_*.png", "page_*.bmp", "page_*.tiff", "page_*.tif", "page_*.webp"]
+    pdf_pages = sorted(
+        f for pattern in IMAGE_GLOB_PATTERNS
+        for f in glob.glob(os.path.join(input_dir, pattern))
+    )
     if not pdf_pages:
         print(f"[ERROR] No source pages found in '{input_dir}'. Run the splitter first.", file=sys.stderr)
         return

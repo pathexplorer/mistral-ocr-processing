@@ -1,18 +1,30 @@
 import os
 import sys
+import shutil
 from pypdf import PdfReader, PdfWriter
 
 def split_pdf_to_pages(source_pdf_path: str, output_directory: str) -> None:
     """
-    Splits a multi-page PDF file into separate single-page PDF files.
+    Splits a multi-page PDF file into separate single-page PDF files,
+    or copies a single image file directly.
     Ensures input file exists and creates output directory if it doesn't.
     """
     # Validation checks
     if not os.path.exists(source_pdf_path):
-        raise FileNotFoundError(f"Source PDF file not found at: {source_pdf_path}")
+        raise FileNotFoundError(f"Source file not found at: {source_pdf_path}")
+
+    ext = os.path.splitext(source_pdf_path)[1].lower()
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+
+    if ext in IMAGE_EXTENSIONS:
+        os.makedirs(output_directory, exist_ok=True)
+        output_path = os.path.join(output_directory, "page_001" + ext)
+        shutil.copy2(source_pdf_path, output_path)
+        print(f"[SUCCESS] Copied image '{source_pdf_path}' to '{output_path}'")
+        return
         
     if not source_pdf_path.lower().endswith('.pdf'):
-        raise ValueError("The provided source file is not a PDF.")
+        raise ValueError("The provided source file is neither a PDF nor a supported image format.")
 
     try:
         # Create output directory safely

@@ -16,8 +16,22 @@ from config import validate_api_key
 # ==========================================
 def split_pdf_to_pages(source_pdf_path: str, output_directory: str) -> int:
     if not os.path.exists(source_pdf_path):
-        raise FileNotFoundError(f"Source PDF not found at: {source_pdf_path}")
-    
+        raise FileNotFoundError(f"Source not found at: {source_pdf_path}")
+
+    ext = os.path.splitext(source_pdf_path)[1].lower()
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+
+    if ext in IMAGE_EXTENSIONS:
+        os.makedirs(output_directory, exist_ok=True)
+        output_path = os.path.join(output_directory, "page_001" + ext)
+        if not os.path.exists(output_path):
+            import shutil
+            shutil.copy2(source_pdf_path, output_path)
+            print(f"[SUCCESS] Copied image '{source_pdf_path}' to '{output_path}'")
+        else:
+            print(f"[SKIP] Image already exists in split pages directory.")
+        return 1  # Single page
+
     os.makedirs(output_directory, exist_ok=True)
     reader = PdfReader(source_pdf_path)
     total_pages = len(reader.pages)
@@ -44,6 +58,12 @@ def extract_native_text_or_mark_for_ocr(pdf_path: str, cache_dir: str) -> bool:
     base_name = os.path.basename(pdf_path)
     md_filename = os.path.splitext(base_name)[0] + ".md"
     md_filepath = os.path.join(cache_dir, md_filename)
+
+    # Image files have no native text → route straight to OCR
+    ext = os.path.splitext(pdf_path)[1].lower()
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+    if ext in IMAGE_EXTENSIONS:
+        return False
     
     if os.path.exists(md_filepath):
         # Validate cached content — skip only if it contains real text, not an error stub
@@ -287,7 +307,11 @@ async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use
     
     # 2. Analyze all pages locally
     print("[INFO] Analyzing text layer status across all pages...")
-    all_pdf_files = sorted(glob.glob(os.path.join(pages_dir, "page_*.pdf")))
+    IMAGE_GLOB_PATTERNS = ["page_*.pdf", "page_*.jpg", "page_*.jpeg", "page_*.png", "page_*.bmp", "page_*.tiff", "page_*.tif", "page_*.webp"]
+    all_pdf_files = sorted(
+        f for pattern in IMAGE_GLOB_PATTERNS
+        for f in glob.glob(os.path.join(pages_dir, pattern))
+    )
     
     ocr_needed_list = []
     native_text_count = 0
@@ -338,11 +362,11 @@ async def main_pipeline(pdf_source: str, workspace_dir: str, output_md: str, use
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Hybrid PDF OCR pipeline — local extraction + Mistral OCR API"
+        description="Hybrid PDF/Image OCR pipeline — local text extraction + Mistral OCR API"
     )
     parser.add_argument(
         "pdf", nargs="?", default="bank_statement.pdf",
-        help="Source PDF file (default: bank_statement.pdf)"
+        help="Source PDF or image file (jpg, jpeg, png, bmp, tiff, webp)  (default: bank_statement.pdf)"
     )
     parser.add_argument(
         "-o", "--output", default="final_clean_statement.md",
